@@ -15,6 +15,8 @@ A minimal memory allocator written in C, built as a teaching project to show how
 - **Splitting**: when a free block is much larger than the request, the remainder becomes a new free block.
 - **Coalescing**: on free, adjacent free blocks are merged to reduce fragmentation.
 - **Alignment**: returned pointers are aligned to `max_align_t`.
+- **`calloc`**: zero-initialized allocation with multiplication overflow checks.
+- **`realloc`**: shrinks in place, grows in place by absorbing a free neighbor, and falls back to allocate-copy-free. On failure the original block is left untouched.
 - **Teardown**: `mini_destroy()` returns the whole arena to the OS.
 
 ## API
@@ -22,6 +24,8 @@ A minimal memory allocator written in C, built as a teaching project to show how
 ```c
 void *mini_malloc(size_t n);  // allocate n bytes; returns NULL on failure
 void  mini_free(void *ptr);   // free a pointer returned by mini_malloc; NULL-safe
+void *mini_calloc(size_t count, size_t size);  // allocate count * size zeroed bytes
+void *mini_realloc(void *ptr, size_t n);       // resize; NULL ptr acts as malloc, n == 0 frees
 void  mini_destroy(void);     // release the entire arena
 ```
 
@@ -62,8 +66,7 @@ All tests passed.
 - Not thread-safe.
 - `mini_free` does not detect double frees or invalid pointers.
 - Both allocation and free walk the entire list, so they are O(n).
-- The test covers only one basic scenario.
-- No `calloc` / `realloc`.
+- Tests cover only a handful of basic scenarios.
 
 ## Roadmap
 
@@ -72,5 +75,5 @@ All tests passed.
 - [ ] Add boundary tags so coalescing becomes O(1)
 - [ ] Switch to an explicit / segregated free list
 - [ ] Grow automatically when the arena runs out
-- [ ] Implement `mini_calloc` / `mini_realloc`
+- [x] Implement `mini_calloc` / `mini_realloc`
 - [ ] Support multithreading with locks or thread-local caches
