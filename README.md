@@ -1,44 +1,44 @@
 # mini-allocator
 
-一个用 C 编写的极简内存分配器教学项目，用来理解 `malloc` / `free` 的基本原理。
+A minimal memory allocator written in C, built as a teaching project to show how `malloc` / `free` work under the hood.
 
-> **项目阶段：初阶**
+> **Project status: early stage**
 >
-> 本项目目前处于初级阶段，只实现了内存分配器最核心的骨架，主要用于学习和演示。
-> 它**不是线程安全的**，也**没有做错误检测和性能优化**，请勿用于生产环境。
+> This project is at a beginner level. It implements only the core skeleton of a memory allocator and is intended for learning and demonstration.
+> It is **not thread-safe** and has **no error detection or performance optimizations**. Do not use it in production.
 
-## 已实现的功能
+## Features
 
-- **单一 arena**：首次分配时通过 `mmap` 向操作系统申请 1 MiB 内存。
-- **隐式链表**：每个块带一个头部（`size` / `next` / `is_free`），所有块按地址顺序串成链表。
-- **First-Fit 分配**：返回第一个足够大的空闲块。
-- **切分（split）**：空闲块比请求大很多时，把剩余部分切成新的空闲块。
-- **合并（coalesce）**：释放时合并相邻的空闲块，减少碎片。
-- **对齐**：返回的指针按 `max_align_t` 对齐。
-- **销毁**：`mini_destroy()` 把整个 arena 归还给操作系统。
+- **Single arena**: requests 1 MiB from the OS via `mmap` on the first allocation.
+- **Implicit list**: each block has a header (`size` / `next` / `is_free`), and all blocks are linked in address order.
+- **First-fit allocation**: returns the first free block that is large enough.
+- **Splitting**: when a free block is much larger than the request, the remainder becomes a new free block.
+- **Coalescing**: on free, adjacent free blocks are merged to reduce fragmentation.
+- **Alignment**: returned pointers are aligned to `max_align_t`.
+- **Teardown**: `mini_destroy()` returns the whole arena to the OS.
 
-## 接口
+## API
 
 ```c
-void *mini_malloc(size_t n);  // 分配 n 字节，失败返回 NULL
-void  mini_free(void *ptr);   // 释放 mini_malloc 返回的指针，NULL 安全
-void  mini_destroy(void);     // 释放整个 arena
+void *mini_malloc(size_t n);  // allocate n bytes; returns NULL on failure
+void  mini_free(void *ptr);   // free a pointer returned by mini_malloc; NULL-safe
+void  mini_destroy(void);     // release the entire arena
 ```
 
-## 编译与运行
+## Build and run
 
 ```sh
 cc -std=c11 -Wall -Wextra -o mini_allocator mini_allocator.c
 ./mini_allocator
 ```
 
-建议在调试时加上 sanitizer：
+Adding sanitizers is recommended while debugging:
 
 ```sh
 cc -std=c11 -Wall -Wextra -fsanitize=address,undefined -o mini_allocator mini_allocator.c
 ```
 
-预期输出（地址因机器而异）：
+Expected output (addresses vary by machine):
 
 ```
 a=0x...018: hello allocator
@@ -47,30 +47,30 @@ c=0x...018 (reused a's address)
 All tests passed.
 ```
 
-## 内存布局
+## Memory layout
 
 ```
-┌────┬──────────────┬────┬──────────────┬────┬───────────────────┐
-│ 头 │ 用户数据 a   │ 头 │ 用户数据 b   │ 头 │ 剩余空闲空间      │
-└────┴──────────────┴────┴──────────────┴────┴───────────────────┘
-      ↑ mini_malloc 返回的是头部之后的地址
+┌──────┬──────────────┬──────┬──────────────┬──────┬────────────────┐
+│ hdr  │ user data a  │ hdr  │ user data b  │ hdr  │ remaining free │
+└──────┴──────────────┴──────┴──────────────┴──────┴────────────────┘
+        ↑ mini_malloc returns the address right after the header
 ```
 
-## 已知局限
+## Known limitations
 
-- arena 固定为 1 MiB，用完后不能扩容。
-- 不是线程安全的。
-- `mini_free` 不检测重复释放和非法指针。
-- 分配和释放都要遍历整条链表，时间复杂度为 O(n)。
-- 测试只覆盖了一个基础场景。
-- 没有实现 `calloc` / `realloc`。
+- The arena is fixed at 1 MiB and cannot grow once it is used up.
+- Not thread-safe.
+- `mini_free` does not detect double frees or invalid pointers.
+- Both allocation and free walk the entire list, so they are O(n).
+- The test covers only one basic scenario.
+- No `calloc` / `realloc`.
 
-## 后续计划
+## Roadmap
 
-- [ ] 在 `mini_free` 中检测重复释放和越界指针
-- [ ] 增加链表不变量检查和随机压力测试
-- [ ] 引入边界标记（boundary tags），让合并操作变成 O(1)
-- [ ] 改用显式空闲链表 / 分离空闲链表
-- [ ] arena 用尽时自动扩容
-- [ ] 实现 `mini_calloc` / `mini_realloc`
-- [ ] 加锁或线程本地缓存，支持多线程
+- [ ] Detect double frees and out-of-arena pointers in `mini_free`
+- [ ] Add list invariant checks and randomized stress tests
+- [ ] Add boundary tags so coalescing becomes O(1)
+- [ ] Switch to an explicit / segregated free list
+- [ ] Grow automatically when the arena runs out
+- [ ] Implement `mini_calloc` / `mini_realloc`
+- [ ] Support multithreading with locks or thread-local caches
