@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <pthread.h>
 
 // Minimum size of each arena requested from the operating system.
 #define ARENA_SIZE (1024u * 1024u)
@@ -37,6 +38,9 @@ union Arena {
 };
 
 static Arena *arenas = NULL;
+
+// Protects the arena list and every block header.
+static pthread_mutex_t heap_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // Round n up to a multiple of the maximum alignment.
 static size_t align_up(size_t n) {
@@ -129,7 +133,7 @@ static void merge_next_if_free(Block *b) {
     }
 }
 
-void *mini_malloc(size_t n) {
+static void *malloc_unlocked(size_t n) {
     if (n == 0 || n > MAX_REQUEST)
         return NULL;
 
@@ -158,7 +162,14 @@ void *mini_malloc(size_t n) {
     return b + 1;
 }
 
-void mini_free(void *ptr) {
+void *mini_malloc(size_t n) {
+    pthread_mutex_lock(&heap_lock);
+    void *p = malloc_unlocked(n);
+    pthread_mutex_unlock(&heap_lock);
+    return p;
+}
+
+static void free_unlocked(void *ptr) {
     if (ptr == NULL)
         return;
 
@@ -186,6 +197,12 @@ void mini_free(void *ptr) {
     }
 }
 
+void mini_free(void *ptr) {
+    pthread_mutex_lock(&heap_lock);
+    free_unlocked(ptr);
+    pthread_mutex_unlock(&heap_lock);
+}
+
 // Allocate zero-initialized memory for `count` objects of `size` bytes.
 void *mini_calloc(size_t count, size_t size) {
     // Reject sizes whose product would overflow.
@@ -203,12 +220,12 @@ void *mini_calloc(size_t count, size_t size) {
 }
 
 // Resize an allocation, in place when possible.
-void *mini_realloc(void *ptr, size_t n) {
+static void *realloc_unlocked(void *ptr, size_t n) {
     if (ptr == NULL)
-        return mini_malloc(n);
+        return malloc_unlocked(n);
 
     if (n == 0) {
-        mini_free(ptr);
+        free_unlocked(ptr);
         return NULL;
     }
 
@@ -238,18 +255,25 @@ void *mini_realloc(void *ptr, size_t n) {
 
     // Otherwise move, possibly into a new arena.
     // On failure the original block stays valid.
-    void *p = mini_malloc(n);
+    void *p = malloc_unlocked(n);
     if (p == NULL)
         return NULL;
 
     // The new block is larger, so copy the old payload size.
     memcpy(p, ptr, b->meta.size);
-    mini_free(ptr);
+    free_unlocked(ptr);
+    return p;
+}
+
+void *mini_realloc(void *ptr, size_t n) {
+    pthread_mutex_lock(&heap_lock);
+    void *p = realloc_unlocked(ptr, n);
+    pthread_mutex_unlock(&heap_lock);
     return p;
 }
 
 // Return every arena to the operating system.
-void mini_destroy(void) {
+static void destroy_unlocked(void) {
     Arena *a = arenas;
 
     while (a != NULL) {
@@ -259,6 +283,12 @@ void mini_destroy(void) {
     }
 
     arenas = NULL;
+}
+
+void mini_destroy(void) {
+    pthread_mutex_lock(&heap_lock);
+    destroy_unlocked();
+    pthread_mutex_unlock(&heap_lock);
 }
 
 static size_t arena_count(void) {
