@@ -1,19 +1,12 @@
-
 #define _DEFAULT_SOURCE
-#include <assert.h>
+#include "mini_allocator.h"
+
+#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <pthread.h>
-
-// Minimum size of each arena requested from the operating system.
-#define ARENA_SIZE (1024u * 1024u)
-
-// Requests above this limit are rejected so size arithmetic cannot overflow.
-#define MAX_REQUEST (SIZE_MAX / 2)
 
 // Block header. The union ensures proper alignment.
 typedef union Block Block;
@@ -61,8 +54,8 @@ static Arena *new_arena(size_t want) {
 
     // mmap hands out whole pages, so round up to use all of them.
     size_t size = want + overhead;
-    if (size < ARENA_SIZE)
-        size = ARENA_SIZE;
+    if (size < MINI_ARENA_SIZE)
+        size = MINI_ARENA_SIZE;
     size = ((size + page - 1) / page) * page;
 
     void *mem = mmap(NULL, size,
@@ -134,7 +127,7 @@ static void merge_next_if_free(Block *b) {
 }
 
 static void *malloc_unlocked(size_t n) {
-    if (n == 0 || n > MAX_REQUEST)
+    if (n == 0 || n > MINI_MAX_REQUEST)
         return NULL;
 
     const size_t want = align_up(n);
@@ -229,7 +222,7 @@ static void *realloc_unlocked(void *ptr, size_t n) {
         return NULL;
     }
 
-    if (n > MAX_REQUEST)
+    if (n > MINI_MAX_REQUEST)
         return NULL;
 
     const size_t want = align_up(n);
@@ -291,146 +284,13 @@ void mini_destroy(void) {
     pthread_mutex_unlock(&heap_lock);
 }
 
-static size_t arena_count(void) {
+size_t mini_arena_count(void) {
+    pthread_mutex_lock(&heap_lock);
+
     size_t count = 0;
     for (Arena *a = arenas; a != NULL; a = a->meta.next)
         count++;
+
+    pthread_mutex_unlock(&heap_lock);
     return count;
-}
-
-static void test_malloc_free(void) {
-    char *a = mini_malloc(100);
-    char *b = mini_malloc(200);
-
-    assert(a != NULL && b != NULL);
-
-    strcpy(a, "hello allocator");
-
-    printf("a=%p: %s\n", (void *)a, a);
-    printf("b=%p\n", (void *)b);
-
-    mini_free(a);
-    mini_free(b);
-
-    char *c = mini_malloc(256);
-    assert(c != NULL);
-
-    // Verify memory reuse.
-    assert(c == a);
-
-    printf("c=%p (reused a's address)\n", (void *)c);
-
-    mini_free(c);
-    mini_destroy();
-}
-
-static void test_calloc(void) {
-    // Dirty a block first so calloc must clear reused memory.
-    unsigned char *dirty = mini_malloc(64);
-    assert(dirty != NULL);
-    memset(dirty, 0xAB, 64);
-    mini_free(dirty);
-
-    int *z = mini_calloc(16, sizeof(int));
-    assert(z != NULL);
-    for (int i = 0; i < 16; i++)
-        assert(z[i] == 0);
-
-    // Overflowing count * size must fail.
-    assert(mini_calloc(SIZE_MAX, 2) == NULL);
-
-    mini_free(z);
-    mini_destroy();
-}
-
-static void test_realloc(void) {
-    // NULL pointer behaves like malloc.
-    char *a = mini_realloc(NULL, 100);
-    assert(a != NULL);
-    strcpy(a, "hello");
-
-    // Next block is free, so growth happens in place.
-    char *a2 = mini_realloc(a, 300);
-    assert(a2 == a);
-    assert(strcmp(a2, "hello") == 0);
-
-    // Block the space after a2 so further growth must move.
-    char *wall = mini_malloc(16);
-    assert(wall != NULL);
-
-    char *a3 = mini_realloc(a2, 1000);
-    assert(a3 != NULL && a3 != a2);
-    assert(strcmp(a3, "hello") == 0);
-
-    // Shrinking keeps the same address.
-    char *a4 = mini_realloc(a3, 8);
-    assert(a4 == a3);
-    assert(strcmp(a4, "hello") == 0);
-
-    // Too large a request fails and leaves the original intact.
-    assert(mini_realloc(a4, MAX_REQUEST + 1) == NULL);
-    assert(strcmp(a4, "hello") == 0);
-
-    // Size zero frees the block.
-    assert(mini_realloc(a4, 0) == NULL);
-
-    mini_free(wall);
-    mini_destroy();
-}
-
-static void test_arena_growth(void) {
-    // 20 x 100 KiB does not fit in one 1 MiB arena.
-    enum { COUNT = 20, SZ = 100 * 1024 };
-    unsigned char *p[COUNT];
-
-    for (int i = 0; i < COUNT; i++) {
-        p[i] = mini_malloc(SZ);
-        assert(p[i] != NULL);
-        memset(p[i], i, SZ);
-    }
-    assert(arena_count() >= 2);
-
-    // No block overlaps another, even across arenas.
-    for (int i = 0; i < COUNT; i++)
-        for (size_t k = 0; k < SZ; k++)
-            assert(p[i][k] == (unsigned char)i);
-
-    // A request larger than ARENA_SIZE gets its own, larger arena.
-    size_t before = arena_count();
-    unsigned char *big = mini_malloc(3 * ARENA_SIZE);
-    assert(big != NULL);
-    memset(big, 0x5A, 3 * ARENA_SIZE);
-    assert(arena_count() == before + 1);
-
-    // Free space in an older arena is reused before mapping more.
-    mini_free(p[0]);
-    before = arena_count();
-    unsigned char *again = mini_malloc(SZ);
-    assert(again == p[0]);
-    assert(arena_count() == before);
-
-    // realloc can move a block into a new arena and keep its data.
-    memset(again, 0x3C, SZ);
-    unsigned char *moved = mini_realloc(again, 2 * ARENA_SIZE);
-    assert(moved != NULL && moved != again);
-    for (size_t k = 0; k < SZ; k++)
-        assert(moved[k] == 0x3C);
-
-    mini_free(moved);
-    mini_free(big);
-    for (int i = 1; i < COUNT; i++)
-        mini_free(p[i]);
-
-    mini_destroy();
-    assert(arena_count() == 0);
-}
-
-int main(void) {
-    test_malloc_free();
-    test_calloc();
-    test_realloc();
-    test_arena_growth();
-
-    puts("All tests passed.");
-    return 0;
 }
