@@ -6,8 +6,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
+// Minimum size of each arena requested from the operating system.
 #define ARENA_SIZE (1024u * 1024u)
+
+// Requests above this limit are rejected so size arithmetic cannot overflow.
+#define MAX_REQUEST (SIZE_MAX / 2)
 
 // Block header. The union ensures proper alignment.
 typedef union Block Block;
@@ -20,30 +25,79 @@ union Block {
     max_align_t alignment;
 };
 
-static Block *head = NULL;
+// Arena header, placed at the start of every mmap'd region.
+// Each arena holds its own address-ordered list of blocks.
+typedef union Arena Arena;
+union Arena {
+    struct {
+        size_t size;   // total bytes mapped, including this header
+        Arena *next;   // next arena in the global arena list
+    } meta;
+    max_align_t alignment;
+};
 
-// Request 1 MiB from the operating system.
-static int init_arena(void) {
-    void *mem = mmap(NULL, ARENA_SIZE,
-                     PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS,
-                     -1, 0);
-
-    if (mem == MAP_FAILED)
-        return -1;
-
-    head = mem;
-    head->meta.size = ARENA_SIZE - sizeof(Block);
-    head->meta.next = NULL;
-    head->meta.is_free = 1;
-
-    return 0;
-}
+static Arena *arenas = NULL;
 
 // Round n up to a multiple of the maximum alignment.
 static size_t align_up(size_t n) {
     const size_t align = _Alignof(max_align_t);
     return ((n + align - 1) / align) * align;
+}
+
+// The first block lives right after the arena header.
+static Block *arena_first_block(Arena *a) {
+    return (Block *)(a + 1);
+}
+
+// Map a new arena with room for at least `want` payload bytes
+// and append it to the arena list.
+static Arena *new_arena(size_t want) {
+    const size_t overhead = sizeof(Arena) + sizeof(Block);
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+
+    // mmap hands out whole pages, so round up to use all of them.
+    size_t size = want + overhead;
+    if (size < ARENA_SIZE)
+        size = ARENA_SIZE;
+    size = ((size + page - 1) / page) * page;
+
+    void *mem = mmap(NULL, size,
+                     PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS,
+                     -1, 0);
+
+    if (mem == MAP_FAILED)
+        return NULL;
+
+    Arena *a = mem;
+    a->meta.size = size;
+    a->meta.next = NULL;
+
+    Block *first = arena_first_block(a);
+    first->meta.size = size - overhead;
+    first->meta.next = NULL;
+    first->meta.is_free = 1;
+
+    // Append so older arenas are searched first.
+    Arena **link = &arenas;
+    while (*link != NULL)
+        link = &(*link)->meta.next;
+    *link = a;
+
+    return a;
+}
+
+// Find the arena whose mapped range contains ptr, or NULL.
+static Arena *arena_of(const void *ptr) {
+    const uintptr_t p = (uintptr_t)ptr;
+
+    for (Arena *a = arenas; a != NULL; a = a->meta.next) {
+        const uintptr_t start = (uintptr_t)a;
+        if (p >= start && p < start + a->meta.size)
+            return a;
+    }
+
+    return NULL;
 }
 
 // Split b into a block of exactly `want` bytes plus a new free block,
@@ -76,36 +130,49 @@ static void merge_next_if_free(Block *b) {
 }
 
 void *mini_malloc(size_t n) {
-    if (n == 0 || n > ARENA_SIZE)
-        return NULL;
-
-    if (head == NULL && init_arena() != 0)
+    if (n == 0 || n > MAX_REQUEST)
         return NULL;
 
     const size_t want = align_up(n);
 
-    // First-Fit: find the first suitable free block.
-    for (Block *b = head; b != NULL; b = b->meta.next) {
-        if (!b->meta.is_free || b->meta.size < want)
-            continue;
+    // First-Fit across all arenas, oldest first.
+    for (Arena *a = arenas; a != NULL; a = a->meta.next) {
+        for (Block *b = arena_first_block(a); b != NULL; b = b->meta.next) {
+            if (!b->meta.is_free || b->meta.size < want)
+                continue;
 
-        split_block(b, want);
-        b->meta.is_free = 0;
-        return b + 1;
+            split_block(b, want);
+            b->meta.is_free = 0;
+            return b + 1;
+        }
     }
 
-    return NULL;
+    // No fit anywhere: grow by mapping a new arena.
+    Arena *a = new_arena(want);
+    if (a == NULL)
+        return NULL;
+
+    Block *b = arena_first_block(a);
+    split_block(b, want);
+    b->meta.is_free = 0;
+    return b + 1;
 }
 
 void mini_free(void *ptr) {
     if (ptr == NULL)
         return;
 
+    // Ignore pointers that do not belong to any arena.
+    Arena *a = arena_of(ptr);
+    if (a == NULL)
+        return;
+
     Block *b = (Block *)ptr - 1;
     b->meta.is_free = 1;
 
-    // Coalesce neighboring free blocks.
-    for (Block *cur = head;
+    // Coalesce neighboring free blocks within the owning arena only.
+    // Arenas are not contiguous in memory, so blocks never merge across them.
+    for (Block *cur = arena_first_block(a);
          cur != NULL && cur->meta.next != NULL;) {
 
         Block *next = cur->meta.next;
@@ -145,7 +212,7 @@ void *mini_realloc(void *ptr, size_t n) {
         return NULL;
     }
 
-    if (n > ARENA_SIZE)
+    if (n > MAX_REQUEST)
         return NULL;
 
     const size_t want = align_up(n);
@@ -160,6 +227,7 @@ void *mini_realloc(void *ptr, size_t n) {
     }
 
     // Grow in place by absorbing a free next block.
+    // The next block is always in the same arena.
     Block *next = b->meta.next;
     if (next != NULL && next->meta.is_free &&
         b->meta.size + sizeof(Block) + next->meta.size >= want) {
@@ -168,7 +236,8 @@ void *mini_realloc(void *ptr, size_t n) {
         return ptr;
     }
 
-    // Otherwise move. On failure the original block stays valid.
+    // Otherwise move, possibly into a new arena.
+    // On failure the original block stays valid.
     void *p = mini_malloc(n);
     if (p == NULL)
         return NULL;
@@ -179,11 +248,24 @@ void *mini_realloc(void *ptr, size_t n) {
     return p;
 }
 
+// Return every arena to the operating system.
 void mini_destroy(void) {
-    if (head != NULL) {
-        munmap(head, ARENA_SIZE);
-        head = NULL;
+    Arena *a = arenas;
+
+    while (a != NULL) {
+        Arena *next = a->meta.next;  // read before unmapping
+        munmap(a, a->meta.size);
+        a = next;
     }
+
+    arenas = NULL;
+}
+
+static size_t arena_count(void) {
+    size_t count = 0;
+    for (Arena *a = arenas; a != NULL; a = a->meta.next)
+        count++;
+    return count;
 }
 
 static void test_malloc_free(void) {
@@ -256,7 +338,7 @@ static void test_realloc(void) {
     assert(strcmp(a4, "hello") == 0);
 
     // Too large a request fails and leaves the original intact.
-    assert(mini_realloc(a4, ARENA_SIZE + 1) == NULL);
+    assert(mini_realloc(a4, MAX_REQUEST + 1) == NULL);
     assert(strcmp(a4, "hello") == 0);
 
     // Size zero frees the block.
@@ -266,10 +348,58 @@ static void test_realloc(void) {
     mini_destroy();
 }
 
+static void test_arena_growth(void) {
+    // 20 x 100 KiB does not fit in one 1 MiB arena.
+    enum { COUNT = 20, SZ = 100 * 1024 };
+    unsigned char *p[COUNT];
+
+    for (int i = 0; i < COUNT; i++) {
+        p[i] = mini_malloc(SZ);
+        assert(p[i] != NULL);
+        memset(p[i], i, SZ);
+    }
+    assert(arena_count() >= 2);
+
+    // No block overlaps another, even across arenas.
+    for (int i = 0; i < COUNT; i++)
+        for (size_t k = 0; k < SZ; k++)
+            assert(p[i][k] == (unsigned char)i);
+
+    // A request larger than ARENA_SIZE gets its own, larger arena.
+    size_t before = arena_count();
+    unsigned char *big = mini_malloc(3 * ARENA_SIZE);
+    assert(big != NULL);
+    memset(big, 0x5A, 3 * ARENA_SIZE);
+    assert(arena_count() == before + 1);
+
+    // Free space in an older arena is reused before mapping more.
+    mini_free(p[0]);
+    before = arena_count();
+    unsigned char *again = mini_malloc(SZ);
+    assert(again == p[0]);
+    assert(arena_count() == before);
+
+    // realloc can move a block into a new arena and keep its data.
+    memset(again, 0x3C, SZ);
+    unsigned char *moved = mini_realloc(again, 2 * ARENA_SIZE);
+    assert(moved != NULL && moved != again);
+    for (size_t k = 0; k < SZ; k++)
+        assert(moved[k] == 0x3C);
+
+    mini_free(moved);
+    mini_free(big);
+    for (int i = 1; i < COUNT; i++)
+        mini_free(p[i]);
+
+    mini_destroy();
+    assert(arena_count() == 0);
+}
+
 int main(void) {
     test_malloc_free();
     test_calloc();
     test_realloc();
+    test_arena_growth();
 
     puts("All tests passed.");
     return 0;

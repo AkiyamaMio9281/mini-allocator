@@ -9,15 +9,15 @@ A minimal memory allocator written in C, built as a teaching project to show how
 
 ## Features
 
-- **Single arena**: requests 1 MiB from the OS via `mmap` on the first allocation.
-- **Implicit list**: each block has a header (`size` / `next` / `is_free`), and all blocks are linked in address order.
+- **Growing arenas**: memory comes from the OS via `mmap` in arenas of at least 1 MiB, rounded up to whole pages. When no arena has a large enough free block, a new arena is mapped instead of returning `NULL`, so requests larger than 1 MiB also succeed.
+- **Implicit list**: each block has a header (`size` / `next` / `is_free`), and the blocks of each arena are linked in address order.
 - **First-fit allocation**: returns the first free block that is large enough.
 - **Splitting**: when a free block is much larger than the request, the remainder becomes a new free block.
-- **Coalescing**: on free, adjacent free blocks are merged to reduce fragmentation.
+- **Coalescing**: on free, adjacent free blocks in the same arena are merged to reduce fragmentation. Blocks never merge across arenas, since arenas are not contiguous in memory.
 - **Alignment**: returned pointers are aligned to `max_align_t`.
 - **`calloc`**: zero-initialized allocation with multiplication overflow checks.
 - **`realloc`**: shrinks in place, grows in place by absorbing a free neighbor, and falls back to allocate-copy-free. On failure the original block is left untouched.
-- **Teardown**: `mini_destroy()` returns the whole arena to the OS.
+- **Teardown**: `mini_destroy()` returns every arena to the OS.
 
 ## API
 
@@ -26,7 +26,7 @@ void *mini_malloc(size_t n);  // allocate n bytes; returns NULL on failure
 void  mini_free(void *ptr);   // free a pointer returned by mini_malloc; NULL-safe
 void *mini_calloc(size_t count, size_t size);  // allocate count * size zeroed bytes
 void *mini_realloc(void *ptr, size_t n);       // resize; NULL ptr acts as malloc, n == 0 frees
-void  mini_destroy(void);     // release the entire arena
+void  mini_destroy(void);     // release all arenas
 ```
 
 ## Build and run
@@ -45,35 +45,41 @@ cc -std=c11 -Wall -Wextra -fsanitize=address,undefined -o mini_allocator mini_al
 Expected output (addresses vary by machine):
 
 ```
-a=0x...018: hello allocator
-b=0x...098
-c=0x...018 (reused a's address)
+a=0x...028: hello allocator
+b=0x...0a8
+c=0x...028 (reused a's address)
 All tests passed.
 ```
 
 ## Memory layout
 
+Arenas form a linked list. Each arena starts with an arena header, followed by its blocks:
+
 ```
-┌──────┬──────────────┬──────┬──────────────┬──────┬────────────────┐
-│ hdr  │ user data a  │ hdr  │ user data b  │ hdr  │ remaining free │
-└──────┴──────────────┴──────┴──────────────┴──────┴────────────────┘
-        ↑ mini_malloc returns the address right after the header
+arenas ──► [ Arena 0 ] ──► [ Arena 1 ] ──► NULL
+
+Arena 0:
+┌───────┬──────┬──────────────┬──────┬──────────────┬──────┬────────────────┐
+│ arena │ hdr  │ user data a  │ hdr  │ user data b  │ hdr  │ remaining free │
+└───────┴──────┴──────────────┴──────┴──────────────┴──────┴────────────────┘
+               ↑ mini_malloc returns the address right after the block header
 ```
 
 ## Known limitations
 
-- The arena is fixed at 1 MiB and cannot grow once it is used up.
+- Empty arenas are never returned to the OS until `mini_destroy()`.
 - Not thread-safe.
-- `mini_free` does not detect double frees or invalid pointers.
-- Both allocation and free walk the entire list, so they are O(n).
+- `mini_free` ignores pointers outside every arena, but does not detect double frees or pointers into the middle of a block.
+- Allocation walks every block in every arena, and free walks the owning arena, so both are O(n).
 - Tests cover only a handful of basic scenarios.
 
 ## Roadmap
 
-- [ ] Detect double frees and out-of-arena pointers in `mini_free`
+- [ ] Detect double frees and interior pointers in `mini_free`
 - [ ] Add list invariant checks and randomized stress tests
 - [ ] Add boundary tags so coalescing becomes O(1)
 - [ ] Switch to an explicit / segregated free list
-- [ ] Grow automatically when the arena runs out
+- [x] Grow automatically when the arena runs out
+- [ ] Return empty arenas to the OS
 - [x] Implement `mini_calloc` / `mini_realloc`
 - [ ] Support multithreading with locks or thread-local caches
