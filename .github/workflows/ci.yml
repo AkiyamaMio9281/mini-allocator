@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.cc }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    env:
+      # UBSan only prints a warning by default; make it fail the job instead.
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ubuntu 24.04 runners use 32 bits of mmap ASLR entropy, which breaks
+      # the sanitizers' shadow memory layout ("unexpected memory mapping").
+      - name: Reduce ASLR entropy for sanitizers
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Tests (ASan + UBSan)
+        run: make test CC=${{ matrix.cc }}
+
+      - name: Tests (ThreadSanitizer)
+        run: make tsan CC=${{ matrix.cc }}
+
+      # Benchmark timings are too noisy for CI; just make sure it builds.
+      - name: Build benchmark
+        run: make build/bench CC=${{ matrix.cc }}
